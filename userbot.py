@@ -1,16 +1,18 @@
 import os
 import asyncio
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
 
 # ================= CONFIG =================
-api_id = int(os.getenv("API_ID", "your_api_id"))
-api_hash = os.getenv("API_HASH", "your_api_hash")
-session_string = os.getenv("SESSION", "your_session_string")
-
-ADMINS = [123456789]  # <-- apna Telegram ID daalna yaha
+load_dotenv()
+api_id = int(os.getenv("API_ID"))
+api_hash = os.getenv("API_HASH")
+session_string = os.getenv("SESSION")
+ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",")]
+db_path = os.getenv("DB_PATH", "bot_data.db")
 
 save_file = "saved_items.txt"
 if not os.path.exists(save_file):
@@ -22,6 +24,10 @@ client = TelegramClient(StringSession(session_string), api_id, api_hash)
 last_reply_time = {}  # track per-user autoreplies
 scheduled_tasks = {}  # scheduled DMs
 spam_tracker = {}     # spam control
+spammer_running = False
+spammer_task = None
+spammer_text = ""
+spammer_target = None
 
 # ================= UTILS =================
 def is_admin(user_id):
@@ -44,9 +50,9 @@ async def save_handler(event):
         chat_id = event.chat_id
 
         if reply.media:
-            fwd = await client.send_file("me", reply.media, caption=reply.text or "", as_copy=True)
+            await client.send_file("me", reply.media, caption=reply.text or "", as_copy=True)
         else:
-            fwd = await client.send_message("me", reply.text or "")
+            await client.send_message("me", reply.text or "")
 
         link_info = f"\n\n🔗 From: {chat_name} (ID: {chat_id})"
         await client.send_message("me", link_info)
@@ -54,7 +60,7 @@ async def save_handler(event):
         with open(save_file, "a", encoding="utf-8") as f:
             f.write((reply.text or "[Media]") + " | " + str(chat_id) + "\n")
 
-        await event.respond("✅ Saved successfully.")
+        await event.respond("✅ Saved Successfully Boss.")
     except Exception as e:
         await event.respond(f"❌ Error: {str(e)}")
 
@@ -103,11 +109,11 @@ async def delete_saved(event):
 # ================= AUTO REPLIES =================
 @client.on(events.NewMessage(incoming=True))
 async def auto_reply(event):
-    if event.is_private and not event.out:
+    if event.is_private and not event.out:  # Only DM
         user_id = event.sender_id
         now = datetime.now()
 
-        # Spam check
+        # Spam check: more than 2 messages/min
         spam_tracker.setdefault(user_id, [])
         spam_tracker[user_id] = [t for t in spam_tracker[user_id] if (now - t).seconds < 60]
         spam_tracker[user_id].append(now)
@@ -125,10 +131,21 @@ async def auto_reply(event):
         last = last_reply_time.get(user_id)
         if not last or (now - last).seconds > 3600:
             if is_night():
-                await client.send_message(user_id, "🌙 Abhi so raha hu, subah reply karunga.")
+                reply_msg = "🌙 Abhi so raha hu, subah reply karunga."
             else:
-                await client.send_message(user_id, "📴 Abhi offline hu, thodi der baad reply karunga.")
+                reply_msg = "📴 Abhi offline hu, thodi der baad reply karunga."
+
+            sent_msg = await client.send_message(user_id, reply_msg)
             last_reply_time[user_id] = now
+
+            # Auto delete for everyone after sending
+            async def check_delete():
+                await asyncio.sleep(10)
+                try:
+                    await sent_msg.delete()
+                except:
+                    pass
+            asyncio.create_task(check_delete())
 
 # ================= SCHEDULE DM =================
 @client.on(events.NewMessage(outgoing=True, pattern=r"\.schedule (.+) (\d{1,2}:\d{2}) (.+)"))
@@ -142,7 +159,6 @@ async def schedule_msg(event):
         target_time = datetime.strptime(time_str, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
         if target_time < now:
             target_time += timedelta(days=1)
-
         delay = (target_time - now).total_seconds()
 
         await event.respond(f"⏰ Scheduled DM to {username} at {target_time.strftime('%H:%M')}:\n`{msg}`")
@@ -155,8 +171,7 @@ async def schedule_msg(event):
             except Exception as e:
                 await event.respond(f"❌ Failed to send DM: {str(e)}")
 
-        task = asyncio.create_task(send_later())
-        scheduled_tasks[username] = task
+        scheduled_tasks[username] = asyncio.create_task(send_later())
     except Exception as e:
         await event.respond(f"❌ Error: {str(e)}")
 
@@ -181,7 +196,37 @@ async def cancel_schedule(event):
     else:
         await event.respond("⚠️ No such scheduled DM found.")
 
-# ================= START =================
+# ================= RAPID SPAMMER =================
+@client.on(events.NewMessage(outgoing=True, pattern=r"\.start (.+)"))
+async def start_spam(event):
+    global spammer_running, spammer_task, spammer_text, spammer_target
+    if spammer_running:
+        await event.respond("⚠️ g@me already running. Use `.stop` first.")
+        return
+    spammer_text = event.pattern_match.group(1)
+    spammer_target = event.chat_id
+    spammer_running = True
+
+    async def spam_loop():
+        while spammer_running:
+            await client.send_message(spammer_target, spammer_text)
+            await asyncio.sleep(0.5)  # very fast
+
+    spammer_task = asyncio.create_task(spam_loop())
+    await event.respond("strted!")
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"\.stop"))
+async def stop_spam(event):
+    global spammer_running, spammer_task
+    if spammer_running:
+        spammer_running = False
+        spammer_task.cancel()
+        spammer_task = None
+        await event.respond("Ok.")
+    else:
+        await event.respond("⚠️ No g@me running.")
+
+# ================= START BOT =================
 client.start()
 print("🚀 Userbot running...")
 client.run_until_disconnected()
